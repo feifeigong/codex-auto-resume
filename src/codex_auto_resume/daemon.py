@@ -1,0 +1,184 @@
+from __future__ import annotations
+
+import time
+from dataclasses import asdict
+
+from .app_server import fetch_live_rate_limits
+from .config import AppConfig
+from .paths import sessions_dir
+from .quota import QuotaSnapshot, hint_reset_at, parse_quota_payload, quota_recovered
+from .resume import process_running, spawn_resume
+from .sessions import WaitingSession, latest_quota_from_rollouts, scan_waiting_sessions
+from .state import AppState, load_state, save_state, upsert_thread
+
+
+def _log(cfg: AppConfig, message: str) -> None:
+    path = cfg.resolved_state_dir() / "daemon.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{stamp} {message}\n")
+
+
+def tick(cfg: AppConfig, state: AppState | None = None) -> AppState:
+    now = time.time()
+    state_dir = cfg.resolved_state_dir()
+    state = state or load_state(state_dir)
+    if not cfg.enabled:
+        state.last_status = "disabled"
+        save_state(state_dir, state)
+        return state
+
+    previous = parse_quota_payload(state.last_quota, source="state", fetched_at=state.last_checked_at)
+    snapshot = read_quota(cfg, now)
+    recovered, reason = (
+        quota_recovered(
+            previous,
+            snapshot,
+            ready_used_percent=cfg.ready_used_percent,
+            recovery_drop_percent=cfg.recovery_drop_percent,
+            now=now,
+        )
+        if snapshot
+        else (False, "quota-unknown")
+    )
+    if snapshot:
+        state.last_quota = asdict(snapshot)
+        state.last_quota["primary"] = asdict(snapshot.primary) if snapshot.primary else None
+        state.last_quota["secondary"] = asdict(snapshot.secondary) if snapshot.secondary else None
+    state.last_quota_source = snapshot.source if snapshot else "none"
+    state.last_checked_at = now
+    state.last_status = reason
+
+    since = now - cfg.lookback_hours * 3600
+    waiting = (
+        scan_waiting_sessions(
+            sessions_dir(cfg.resolved_codex_home()),
+            since=since,
+            ready_used_percent=cfg.ready_used_percent,
+        )
+        if cfg.auto_discover
+        else []
+    )
+    _log(cfg, f"quota={reason} source={state.last_quota_source} waiting={len(waiting)}")
+    for item in waiting:
+        current = state.threads.get(item.thread_id)
+        if current and not current.enabled:
+            continue
+        upsert_thread(
+            state,
+            item.thread_id,
+            cwd=item.cwd or (current.cwd if current else None),
+            status="waiting",
+            mark=item.mark,
+            resets_at=item.resets_at,
+            observed_at=item.observed_at,
+            enabled=True if current is None else current.enabled,
+        )
+
+    for thread_id, task in list(state.threads.items()):
+        if not task.enabled:
+            continue
+        if process_running(task.pid):
+            task.status = "running"
+            continue
+        if task.phase == "submitting":
+            task.phase = "needs-review"
+            task.status = "needs-review"
+            task.last_error = "上次续跑提交未确认完成，已停止自动重试，避免重复执行"
+            continue
+        if task.resumes >= cfg.max_auto_windows:
+            task.status = "resume-cap-reached"
+            continue
+        match = next((item for item in waiting if item.thread_id == thread_id), None)
+        if match is None:
+            continue
+        if task.phase == "failed" and task.mark == match.mark:
+            task.status = "resume-failed"
+            continue
+        if task.mark == match.mark and task.resumes:
+            task.status = "already-handled"
+            continue
+        if not recovered:
+            task.status = reason
+            if snapshot:
+                task.resets_at = hint_reset_at(snapshot, cfg.ready_used_percent) or task.resets_at
+            continue
+        _resume_one(cfg, state, task, match, now)
+
+    save_state(state_dir, state)
+    return state
+
+
+def watch_forever(cfg: AppConfig) -> None:
+    state_dir = cfg.resolved_state_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    while True:
+        state = tick(cfg)
+        delay = max(5.0, float(cfg.poll_seconds))
+        resets = [
+            task.resets_at
+            for task in state.threads.values()
+            if task.enabled and task.resets_at and task.status not in {"resumed", "already-handled", "resume-cap-reached"}
+        ]
+        if resets:
+            soonest = min(resets) + cfg.reset_buffer_seconds - time.time()
+            if 0 < soonest < delay:
+                delay = max(5.0, soonest)
+        time.sleep(delay)
+
+
+def read_quota(cfg: AppConfig, now: float) -> QuotaSnapshot | None:
+    env = {"CODEX_HOME": str(cfg.resolved_codex_home())}
+    try:
+        payload = fetch_live_rate_limits(codex_bin=cfg.codex_bin or None, extra_env=env, timeout=18)
+        parsed = parse_quota_payload(payload, source="app-server", fetched_at=now)
+        if parsed:
+            return parsed
+    except Exception as exc:
+        _log(cfg, f"app-server quota failed: {exc}")
+    return latest_quota_from_rollouts(
+        sessions_dir(cfg.resolved_codex_home()),
+        since=now - cfg.lookback_hours * 3600,
+    )
+
+
+def _resume_one(
+    cfg: AppConfig,
+    state: AppState,
+    task,
+    waiting: WaitingSession | None,
+    now: float,
+) -> None:
+    if waiting:
+        task.mark = waiting.mark
+        task.cwd = waiting.cwd or task.cwd
+        task.resets_at = waiting.resets_at
+    log_file = cfg.resolved_state_dir() / "logs" / f"{task.thread_id}.log"
+    task.phase = "submitting"
+    task.status = "resuming"
+    task.last_resume_at = now
+    save_state(cfg.resolved_state_dir(), state)
+    try:
+        pid, mode = spawn_resume(
+            thread_id=task.thread_id,
+            prompt=cfg.resume_prompt,
+            cwd=task.cwd,
+            log_file=log_file,
+            extra_args=list(cfg.extra_resume_args),
+            skip_git_repo_check=cfg.skip_git_repo_check,
+            prefer_queue_if_busy=cfg.prefer_queue_if_busy,
+            codex_bin=cfg.codex_bin or None,
+            extra_env={"CODEX_HOME": str(cfg.resolved_codex_home())},
+        )
+        task.pid = pid
+        task.phase = "sent"
+        task.status = "resumed"
+        task.resumes += 1
+        task.log_file = str(log_file)
+        task.last_error = mode
+    except Exception as exc:
+        task.phase = "failed"
+        task.status = "resume-failed"
+        task.last_error = str(exc)
+        task.log_file = str(log_file)
