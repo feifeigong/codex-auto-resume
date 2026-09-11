@@ -3,14 +3,15 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
 
 from .paths import resolve_codex_command
+from .procutil import hidden_popen
 
 
 class AppServerError(RuntimeError):
@@ -36,10 +37,7 @@ class AppServerClient:
         self.close()
 
     def start(self) -> None:
-        creationflags = 0
-        if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
-            creationflags = subprocess.CREATE_NO_WINDOW
-        self.proc = subprocess.Popen(
+        self.proc = hidden_popen(
             [*self.command, "app-server", "--listen", "stdio://"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -49,7 +47,6 @@ class AppServerClient:
             errors="replace",
             bufsize=1,
             env=self.env,
-            creationflags=creationflags,
         )
         assert self.proc.stdout and self.proc.stderr
         threading.Thread(target=self._read_stdout, daemon=True).start()
@@ -112,11 +109,19 @@ class AppServerClient:
             return result if isinstance(result, dict) else {"result": result}
         raise AppServerError(f"等待 {method} 超时")
 
-    def read_rate_limits(self) -> dict[str, Any]:
+    def read_rate_limits(self, include_credits: bool = False) -> dict[str, Any]:
+        if include_credits:
+            return self.request("account/rateLimits/read", {})
         try:
             return self.request("account/rateLimits/read", {"excludeResetCreditDetails": True})
         except AppServerError:
             return self.request("account/rateLimits/read", {})
+
+    def consume_reset_credit(self, credit_id: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"idempotencyKey": str(uuid.uuid4())}
+        if credit_id:
+            params["creditId"] = credit_id
+        return self.request("account/rateLimitResetCredit/consume", params)
 
     def _write(self, payload: dict[str, Any]) -> None:
         if not self.proc or not self.proc.stdin:
@@ -152,13 +157,14 @@ def fetch_live_rate_limits(
     codex_bin: str | None,
     extra_env: dict[str, str] | None = None,
     timeout: float = 20.0,
+    include_credits: bool = False,
 ) -> dict[str, Any]:
     command = resolve_codex_command(codex_bin)
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
     with AppServerClient(command, env=env, timeout=timeout) as client:
-        return client.read_rate_limits()
+        return client.read_rate_limits(include_credits=include_credits)
 
 
 def doctor_app_server(codex_home: Path, codex_bin: str | None) -> tuple[bool, str, dict[str, Any] | None]:
@@ -167,6 +173,7 @@ def doctor_app_server(codex_home: Path, codex_bin: str | None) -> tuple[bool, st
             codex_bin=codex_bin,
             extra_env={"CODEX_HOME": str(codex_home)},
             timeout=18,
+            include_credits=True,
         )
         return True, "ok", result
     except Exception as exc:

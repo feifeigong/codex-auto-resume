@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 from .paths import resolve_codex_command
+from .procutil import hidden_popen, process_running
 
 BUSY_HINTS = (
     "already owns",
@@ -42,16 +42,12 @@ def spawn_resume(
     handle = log_file.open("a", encoding="utf-8", errors="replace")
     handle.write(f"$ {' '.join(args)}\n")
     handle.flush()
-    creationflags = 0
-    if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
-        creationflags = subprocess.CREATE_NO_WINDOW
-    proc = subprocess.Popen(
+    proc = hidden_popen(
         args,
         cwd=cwd if cwd and Path(cwd).exists() else None,
         stdout=handle,
         stderr=subprocess.STDOUT,
         env=env,
-        creationflags=creationflags,
     )
     if prefer_queue_if_busy:
         try:
@@ -70,7 +66,6 @@ def spawn_resume(
                 handle=handle,
                 env=env,
                 extra_args=extra_args,
-                creationflags=creationflags,
             ), "queue"
         if code != 0:
             raise RuntimeError(f"codex exec resume 失败，exit={code}，详见 {log_file}")
@@ -87,36 +82,15 @@ def _spawn_queue(
     handle,
     env: dict[str, str],
     extra_args: list[str],
-    creationflags: int,
 ) -> int:
     args = [*command, "queue", "--thread", thread_id, "--message", prompt, *extra_args]
     handle.write(f"$ {' '.join(args)}\n")
     handle.flush()
-    proc = subprocess.Popen(
+    proc = hidden_popen(
         args,
         cwd=cwd if cwd and Path(cwd).exists() else None,
         stdout=handle,
         stderr=subprocess.STDOUT,
         env=env,
-        creationflags=creationflags,
     )
     return proc.pid
-
-
-def process_running(pid: int | None) -> bool:
-    if not pid:
-        return False
-    if sys.platform == "win32":
-        query = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        return str(pid) in (query.stdout or "")
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True

@@ -9,6 +9,11 @@ from .paths import default_codex_home, default_state_dir, tool_root
 DEFAULT_PROMPT = (
     "继续完成上一轮因 usage limit 中断的任务。"
     "先检查当前工作区状态，避免重复执行已经完成的修改或命令，然后从未完成步骤继续。"
+    "保留原有任务范围，不要停下来等人确认。"
+)
+LEGACY_PROMPT = (
+    "继续完成上一轮因 usage limit 中断的任务。"
+    "先检查当前工作区状态，避免重复执行已经完成的修改或命令，然后从未完成步骤继续。"
     "保留原有任务范围；需要我提供信息或审批时停下来询问。"
 )
 
@@ -27,6 +32,8 @@ class AppConfig:
     skip_git_repo_check: bool = True
     prefer_queue_if_busy: bool = True
     extra_resume_args: list[str] = field(default_factory=list)
+    auto_redeem_weekly_reset: bool = True
+    reset_credit_cooldown_seconds: float = 600
     codex_home: str = ""
     codex_bin: str = ""
     state_dir: str = ""
@@ -53,6 +60,8 @@ def load_config(path: Path | None = None) -> AppConfig:
         cfg.codex_home = str(default_codex_home())
     if not cfg.state_dir:
         cfg.state_dir = str(target.parent if path else default_state_dir())
+    if cfg.resume_prompt.strip() == LEGACY_PROMPT:
+        cfg.resume_prompt = DEFAULT_PROMPT
     return cfg
 
 

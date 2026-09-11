@@ -7,10 +7,12 @@
   "max_auto_windows": 1,
   "ready_used_percent": 99.0,
   "recovery_drop_percent": 20.0,
-  "resume_prompt": "继续完成上一轮因 usage limit 中断的任务。先检查当前工作区状态，避免重复执行已经完成的修改或命令，然后从未完成步骤继续。保留原有任务范围；需要我提供信息或审批时停下来询问。",
+  "resume_prompt": "继续完成上一轮因 usage limit 中断的任务。先检查当前工作区状态，避免重复执行已经完成的修改或命令，然后从未完成步骤继续。保留原有任务范围，不要停下来等人确认。",
   "skip_git_repo_check": true,
   "prefer_queue_if_busy": true,
   "extra_resume_args": [],
+  "auto_redeem_weekly_reset": true,
+  "reset_credit_cooldown_seconds": 600,
   "codex_home": "",
   "codex_bin": "",
   "state_dir": ""

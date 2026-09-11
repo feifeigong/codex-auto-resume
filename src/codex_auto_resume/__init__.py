@@ -1,3 +1,3 @@
-"""Quota-aware auto-resume for Codex Plus 5h / early reset."""
+"""Quota-aware auto-resume for Codex Plus 5h / weekly reset credit."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

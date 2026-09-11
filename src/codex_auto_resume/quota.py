@@ -52,6 +52,8 @@ class QuotaSnapshot:
     rate_limit_reached_type: str | None = None
     spend_control_reached: bool | None = None
     plan_type: str | None = None
+    reset_credit_count: int | None = None
+    reset_credit_id: str | None = None
     source: str = ""
     fetched_at: float = 0.0
 
@@ -75,6 +77,7 @@ def parse_quota_payload(payload: Any, *, source: str = "", fetched_at: float = 0
         if not isinstance(snapshot, dict):
             return None
     reached = _pick(snapshot, "rateLimitReachedType", "rate_limit_reached_type")
+    credit_count, credit_id = _parse_reset_credits(result)
     return QuotaSnapshot(
         primary=QuotaWindow.from_mapping(snapshot.get("primary")),
         secondary=QuotaWindow.from_mapping(snapshot.get("secondary")),
@@ -82,9 +85,85 @@ def parse_quota_payload(payload: Any, *, source: str = "", fetched_at: float = 0
         rate_limit_reached_type=str(reached) if reached else None,
         spend_control_reached=_as_bool(_pick(snapshot, "spendControlReached", "spend_control_reached")),
         plan_type=_pick(snapshot, "planType", "plan_type") or _pick(result, "planType", "plan_type"),
+        reset_credit_count=credit_count,
+        reset_credit_id=credit_id,
         source=source,
         fetched_at=fetched_at,
     )
+
+
+def _parse_reset_credits(result: dict[str, Any]) -> tuple[int | None, str | None]:
+    bag = result.get("rateLimitResetCredits") or result.get("rate_limit_reset_credits")
+    if not isinstance(bag, dict):
+        return None, None
+    count = _as_int(_pick(bag, "availableCount", "available_count"))
+    credit_id = None
+    rows = bag.get("credits")
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            status = str(row.get("status") or "").lower()
+            ident = row.get("id")
+            if ident and status in {"", "available"}:
+                credit_id = str(ident)
+                break
+    return count, credit_id
+
+
+def is_weekly_window(window: QuotaWindow | None) -> bool:
+    return bool(window and window.window_minutes and window.window_minutes >= 24 * 60)
+
+
+def weekly_window(snapshot: QuotaSnapshot) -> QuotaWindow | None:
+    if snapshot.secondary and (is_weekly_window(snapshot.secondary) or snapshot.primary):
+        return snapshot.secondary
+    if snapshot.primary and is_weekly_window(snapshot.primary) and snapshot.secondary is None:
+        return snapshot.primary
+    return snapshot.secondary
+
+
+def window_exhausted(window: QuotaWindow | None, ready_used_percent: float) -> bool:
+    return bool(window and window.used_percent is not None and window.used_percent >= ready_used_percent)
+
+
+def weekly_exhausted(snapshot: QuotaSnapshot, ready_used_percent: float) -> bool:
+    return window_exhausted(weekly_window(snapshot), ready_used_percent)
+
+
+def five_hour_only_exhausted(snapshot: QuotaSnapshot, ready_used_percent: float) -> bool:
+    primary = snapshot.primary
+    if not window_exhausted(primary, ready_used_percent):
+        return False
+    if is_weekly_window(primary) and snapshot.secondary is None:
+        return False
+    return not weekly_exhausted(snapshot, ready_used_percent)
+
+
+def weekly_needs_reset(snapshot: QuotaSnapshot, ready_used_percent: float) -> tuple[bool, str]:
+    if five_hour_only_exhausted(snapshot, ready_used_percent):
+        return False, "keep-weekly"
+    if not weekly_exhausted(snapshot, ready_used_percent):
+        return False, "weekly-ok"
+    return True, "weekly-exhausted"
+
+
+def can_redeem_credit(snapshot: QuotaSnapshot) -> tuple[bool, str]:
+    if snapshot.reset_credit_count == 0:
+        return False, "weekly-exhausted-no-credit"
+    if snapshot.reset_credit_id or (snapshot.reset_credit_count or 0) > 0:
+        return True, "has-credit"
+    return False, "weekly-exhausted-credit-unknown"
+
+
+def should_redeem_weekly_reset(snapshot: QuotaSnapshot, ready_used_percent: float) -> tuple[bool, str]:
+    need, reason = weekly_needs_reset(snapshot, ready_used_percent)
+    if not need:
+        return False, reason
+    ok, credit_reason = can_redeem_credit(snapshot)
+    if not ok:
+        return False, credit_reason
+    return True, "weekly-exhausted"
 
 
 def _as_bool(value: Any) -> bool | None:

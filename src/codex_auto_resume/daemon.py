@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import asdict
 
-from .app_server import fetch_live_rate_limits
+from .app_server import AppServerClient, fetch_live_rate_limits
 from .config import AppConfig
-from .paths import sessions_dir
+from .paths import resolve_codex_command, sessions_dir
 from .quota import QuotaSnapshot, hint_reset_at, parse_quota_payload, quota_recovered
+from .redeem import try_redeem_weekly_reset
 from .resume import process_running, spawn_resume
 from .sessions import WaitingSession, latest_quota_from_rollouts, scan_waiting_sessions
 from .state import AppState, load_state, save_state, upsert_thread
@@ -20,7 +22,11 @@ def _log(cfg: AppConfig, message: str) -> None:
         handle.write(f"{stamp} {message}\n")
 
 
-def tick(cfg: AppConfig, state: AppState | None = None) -> AppState:
+def tick(
+    cfg: AppConfig,
+    state: AppState | None = None,
+    quota_reader: "LiveQuota | None" = None,
+) -> AppState:
     now = time.time()
     state_dir = cfg.resolved_state_dir()
     state = state or load_state(state_dir)
@@ -30,108 +36,184 @@ def tick(cfg: AppConfig, state: AppState | None = None) -> AppState:
         return state
 
     previous = parse_quota_payload(state.last_quota, source="state", fetched_at=state.last_checked_at)
-    snapshot = read_quota(cfg, now)
-    recovered, reason = (
-        quota_recovered(
-            previous,
-            snapshot,
-            ready_used_percent=cfg.ready_used_percent,
-            recovery_drop_percent=cfg.recovery_drop_percent,
-            now=now,
+    owned_reader = quota_reader is None
+    reader = quota_reader or LiveQuota(cfg)
+    try:
+        snapshot = reader.read(now)
+        if cfg.auto_redeem_weekly_reset and snapshot:
+            previous_note = state.last_reset_credit_note
+            snapshot, redeem_note = reader.try_redeem(snapshot, state, now)
+            if redeem_note and redeem_note != previous_note:
+                _log(cfg, redeem_note)
+        recovered, reason = (
+            quota_recovered(
+                previous,
+                snapshot,
+                ready_used_percent=cfg.ready_used_percent,
+                recovery_drop_percent=cfg.recovery_drop_percent,
+                now=now,
+            )
+            if snapshot
+            else (False, "quota-unknown")
         )
-        if snapshot
-        else (False, "quota-unknown")
-    )
-    if snapshot:
-        state.last_quota = asdict(snapshot)
-        state.last_quota["primary"] = asdict(snapshot.primary) if snapshot.primary else None
-        state.last_quota["secondary"] = asdict(snapshot.secondary) if snapshot.secondary else None
-    state.last_quota_source = snapshot.source if snapshot else "none"
-    state.last_checked_at = now
-    state.last_status = reason
+        if snapshot:
+            state.last_quota = asdict(snapshot)
+            state.last_quota["primary"] = asdict(snapshot.primary) if snapshot.primary else None
+            state.last_quota["secondary"] = asdict(snapshot.secondary) if snapshot.secondary else None
+            state.last_quota["reset_credit_id"] = None
+        state.last_quota_source = snapshot.source if snapshot else "none"
+        state.last_checked_at = now
+        state.last_status = reason
 
-    since = now - cfg.lookback_hours * 3600
-    waiting = (
-        scan_waiting_sessions(
-            sessions_dir(cfg.resolved_codex_home()),
-            since=since,
-            ready_used_percent=cfg.ready_used_percent,
+        since = now - cfg.lookback_hours * 3600
+        waiting = (
+            scan_waiting_sessions(
+                sessions_dir(cfg.resolved_codex_home()),
+                since=since,
+                ready_used_percent=cfg.ready_used_percent,
+            )
+            if cfg.auto_discover
+            else []
         )
-        if cfg.auto_discover
-        else []
-    )
-    _log(cfg, f"quota={reason} source={state.last_quota_source} waiting={len(waiting)}")
-    for item in waiting:
-        current = state.threads.get(item.thread_id)
-        if current and not current.enabled:
-            continue
-        upsert_thread(
-            state,
-            item.thread_id,
-            cwd=item.cwd or (current.cwd if current else None),
-            status="waiting",
-            mark=item.mark,
-            resets_at=item.resets_at,
-            observed_at=item.observed_at,
-            enabled=True if current is None else current.enabled,
-        )
+        _log(cfg, f"quota={reason} source={state.last_quota_source} waiting={len(waiting)}")
+        for item in waiting:
+            current = state.threads.get(item.thread_id)
+            if current and not current.enabled:
+                continue
+            upsert_thread(
+                state,
+                item.thread_id,
+                cwd=item.cwd or (current.cwd if current else None),
+                status="waiting",
+                mark=item.mark,
+                resets_at=item.resets_at,
+                observed_at=item.observed_at,
+                enabled=True if current is None else current.enabled,
+            )
 
-    for thread_id, task in list(state.threads.items()):
-        if not task.enabled:
-            continue
-        if process_running(task.pid):
-            task.status = "running"
-            continue
-        if task.phase == "submitting":
-            task.phase = "needs-review"
-            task.status = "needs-review"
-            task.last_error = "上次续跑提交未确认完成，已停止自动重试，避免重复执行"
-            continue
-        if task.resumes >= cfg.max_auto_windows:
-            task.status = "resume-cap-reached"
-            continue
-        match = next((item for item in waiting if item.thread_id == thread_id), None)
-        if match is None:
-            continue
-        if task.phase == "failed" and task.mark == match.mark:
-            task.status = "resume-failed"
-            continue
-        if task.mark == match.mark and task.resumes:
-            task.status = "already-handled"
-            continue
-        if not recovered:
-            task.status = reason
-            if snapshot:
-                task.resets_at = hint_reset_at(snapshot, cfg.ready_used_percent) or task.resets_at
-            continue
-        _resume_one(cfg, state, task, match, now)
+        for thread_id, task in list(state.threads.items()):
+            if not task.enabled:
+                continue
+            if process_running(task.pid):
+                task.status = "running"
+                continue
+            if task.phase == "submitting":
+                task.phase = "needs-review"
+                task.status = "needs-review"
+                task.last_error = "上次续跑提交未确认完成，已停止自动重试，避免重复执行"
+                continue
+            if task.resumes >= cfg.max_auto_windows:
+                task.status = "resume-cap-reached"
+                continue
+            match = next((item for item in waiting if item.thread_id == thread_id), None)
+            if match is None:
+                continue
+            if task.phase == "failed" and task.mark == match.mark:
+                task.status = "resume-failed"
+                continue
+            if task.mark == match.mark and task.resumes:
+                task.status = "already-handled"
+                continue
+            if not recovered:
+                task.status = reason
+                if snapshot:
+                    task.resets_at = hint_reset_at(snapshot, cfg.ready_used_percent) or task.resets_at
+                continue
+            _resume_one(cfg, state, task, match, now)
 
-    save_state(state_dir, state)
-    return state
+        save_state(state_dir, state)
+        return state
+    finally:
+        if owned_reader:
+            reader.close()
 
 
 def watch_forever(cfg: AppConfig) -> None:
     state_dir = cfg.resolved_state_dir()
     state_dir.mkdir(parents=True, exist_ok=True)
-    while True:
-        state = tick(cfg)
-        delay = max(5.0, float(cfg.poll_seconds))
-        resets = [
-            task.resets_at
-            for task in state.threads.values()
-            if task.enabled and task.resets_at and task.status not in {"resumed", "already-handled", "resume-cap-reached"}
-        ]
-        if resets:
-            soonest = min(resets) + cfg.reset_buffer_seconds - time.time()
-            if 0 < soonest < delay:
-                delay = max(5.0, soonest)
-        time.sleep(delay)
+    reader = LiveQuota(cfg)
+    try:
+        while True:
+            state = tick(cfg, quota_reader=reader)
+            delay = max(5.0, float(cfg.poll_seconds))
+            resets = [
+                task.resets_at
+                for task in state.threads.values()
+                if task.enabled
+                and task.resets_at
+                and task.status not in {"resumed", "already-handled", "resume-cap-reached"}
+            ]
+            if resets:
+                soonest = min(resets) + cfg.reset_buffer_seconds - time.time()
+                if 0 < soonest < delay:
+                    delay = max(5.0, soonest)
+            time.sleep(delay)
+    finally:
+        reader.close()
+
+
+class LiveQuota:
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+        self.client: AppServerClient | None = None
+
+    def read(self, now: float) -> QuotaSnapshot | None:
+        try:
+            payload = self._live_payload()
+            parsed = parse_quota_payload(payload, source="app-server", fetched_at=now)
+            if parsed:
+                return parsed
+        except Exception as exc:
+            self.close()
+            _log(self.cfg, f"app-server quota failed: {exc}")
+        return latest_quota_from_rollouts(
+            sessions_dir(self.cfg.resolved_codex_home()),
+            since=now - self.cfg.lookback_hours * 3600,
+        )
+
+    def try_redeem(
+        self,
+        snapshot: QuotaSnapshot,
+        state: AppState,
+        now: float,
+    ) -> tuple[QuotaSnapshot, str]:
+        if self.client is None:
+            return snapshot, ""
+        return try_redeem_weekly_reset(
+            cfg=self.cfg,
+            snapshot=snapshot,
+            state=state,
+            now=now,
+            client=self.client,
+        )
+
+    def _live_payload(self) -> dict:
+        if self.client is None:
+            env = os.environ.copy()
+            env["CODEX_HOME"] = str(self.cfg.resolved_codex_home())
+            self.client = AppServerClient(
+                resolve_codex_command(self.cfg.codex_bin or None),
+                env=env,
+                timeout=18,
+            )
+            self.client.start()
+        return self.client.read_rate_limits(include_credits=False)
+
+    def close(self) -> None:
+        if self.client is not None:
+            self.client.close()
+            self.client = None
 
 
 def read_quota(cfg: AppConfig, now: float) -> QuotaSnapshot | None:
     env = {"CODEX_HOME": str(cfg.resolved_codex_home())}
     try:
-        payload = fetch_live_rate_limits(codex_bin=cfg.codex_bin or None, extra_env=env, timeout=18)
+        payload = fetch_live_rate_limits(
+            codex_bin=cfg.codex_bin or None,
+            extra_env=env,
+            timeout=18,
+            include_credits=True,
+        )
         parsed = parse_quota_payload(payload, source="app-server", fetched_at=now)
         if parsed:
             return parsed

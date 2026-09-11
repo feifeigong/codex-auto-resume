@@ -32,6 +32,9 @@ class AppState:
     last_quota_source: str = ""
     last_checked_at: float = 0.0
     last_quota: dict[str, Any] = field(default_factory=dict)
+    last_reset_credit_at: float = 0.0
+    last_reset_credit_id: str = ""
+    last_reset_credit_note: str = ""
 
 
 def state_path(state_dir: Path) -> Path:
@@ -57,6 +60,9 @@ def load_state(state_dir: Path) -> AppState:
         last_quota_source=str(raw.get("last_quota_source") or ""),
         last_checked_at=float(raw.get("last_checked_at") or 0),
         last_quota=raw.get("last_quota") if isinstance(raw.get("last_quota"), dict) else {},
+        last_reset_credit_at=float(raw.get("last_reset_credit_at") or 0),
+        last_reset_credit_id=str(raw.get("last_reset_credit_id") or ""),
+        last_reset_credit_note=str(raw.get("last_reset_credit_note") or ""),
     )
 
 
@@ -69,6 +75,9 @@ def save_state(state_dir: Path, state: AppState) -> Path:
         "last_quota_source": state.last_quota_source,
         "last_checked_at": state.last_checked_at,
         "last_quota": state.last_quota,
+        "last_reset_credit_at": state.last_reset_credit_at,
+        "last_reset_credit_id": state.last_reset_credit_id,
+        "last_reset_credit_note": state.last_reset_credit_note,
         "threads": {key: asdict(value) for key, value in state.threads.items()},
     }
     tmp = path.with_suffix(".json.tmp")

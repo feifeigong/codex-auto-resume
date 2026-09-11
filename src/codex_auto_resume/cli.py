@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import subprocess
 import sys
 import time
@@ -12,7 +11,7 @@ from .app_server import doctor_app_server
 from .config import AppConfig, load_config, save_config
 from .daemon import read_quota, tick, watch_forever
 from .paths import resolve_codex_command, sessions_dir, tool_root
-from .quota import hint_reset_at, quota_available
+from .quota import hint_reset_at, parse_quota_payload, quota_available
 from .sessions import scan_waiting_sessions
 from .state import load_state, save_state, upsert_thread
 
@@ -82,8 +81,13 @@ def cmd_doctor(cfg: AppConfig) -> int:
     print(f"sessions_exist   {sessions.exists()}")
     ok, message, payload = doctor_app_server(cfg.resolved_codex_home(), cfg.codex_bin or None)
     print(f"app_server       {'OK' if ok else 'FAIL'} {message}")
-    if payload:
-        print(f"rate_limits      {json.dumps(payload, ensure_ascii=False)[:800]}")
+    snap = parse_quota_payload(payload, source="app-server") if payload else None
+    if snap and snap.primary:
+        print(f"5h               {snap.primary.used_percent}%")
+    if snap and snap.secondary:
+        print(f"weekly           {snap.secondary.used_percent}%")
+    if snap and snap.reset_credit_count is not None:
+        print(f"reset_credits    {snap.reset_credit_count}")
     now = time.time()
     waiting = scan_waiting_sessions(
         sessions,
@@ -105,6 +109,8 @@ def cmd_status(cfg: AppConfig) -> int:
         print(f"quota            {reason}  available={available}  source={snapshot.source}")
         print(f"plan             {snapshot.plan_type or '-'}")
         print(f"reset_at         {reset_at or '-'}")
+        print(f"reset_credits    {snapshot.reset_credit_count if snapshot.reset_credit_count is not None else '-'}")
+        print(f"auto_redeem      {cfg.auto_redeem_weekly_reset}")
         if snapshot.primary:
             print(
                 f"5h               {snapshot.primary.used_percent}%  resets_at={snapshot.primary.resets_at}"
@@ -116,6 +122,8 @@ def cmd_status(cfg: AppConfig) -> int:
     else:
         print("quota            unknown")
     state = load_state(cfg.resolved_state_dir())
+    if state.last_reset_credit_note:
+        print(f"last_redeem      {state.last_reset_credit_note}")
     if not state.threads:
         print("threads          (empty)")
         return 0

@@ -38,29 +38,23 @@ def tool_root() -> Path:
 
 def resolve_codex_command(explicit: str | None = None) -> list[str]:
     if explicit:
-        return _split_or_single(explicit)
+        return _without_console_wrapper(_split_or_single(explicit))
 
     env_bin = os.environ.get("CODEX_BIN", "").strip()
     if env_bin:
-        return _split_or_single(env_bin)
+        return _without_console_wrapper(_split_or_single(env_bin))
 
-    if sys.platform == "win32":
-        appdata = Path(os.environ.get("APPDATA") or (home_dir() / "AppData" / "Roaming"))
-        cmd = appdata / "npm" / "codex.cmd"
-        if cmd.exists():
-            return [str(cmd)]
-        js = appdata / "npm" / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
-        node = shutil.which("node")
-        if js.exists() and node:
-            return [node, str(js)]
+    native = _find_native_codex()
+    if native:
+        return [native]
+
+    node_js = _find_node_js_codex()
+    if node_js:
+        return node_js
 
     which = shutil.which("codex")
     if which:
-        if sys.platform == "win32" and which.lower().endswith(".ps1"):
-            sibling = Path(which).with_suffix(".cmd")
-            if sibling.exists():
-                return [str(sibling)]
-        return [which]
+        return _without_console_wrapper([which])
 
     mac_bundled = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
     if mac_bundled.exists():
@@ -70,6 +64,47 @@ def resolve_codex_command(explicit: str | None = None) -> list[str]:
         return [str(mac_codex_app)]
 
     raise FileNotFoundError("找不到 codex 可执行文件，请把 Codex CLI 加入 PATH，或设置 CODEX_BIN")
+
+
+def _npm_root() -> Path:
+    return Path(os.environ.get("APPDATA") or (home_dir() / "AppData" / "Roaming")) / "npm"
+
+
+def _find_native_codex() -> str | None:
+    roots = [
+        _npm_root() / "node_modules" / "@openai" / "codex",
+        _npm_root() / "node_modules" / "@openai" / "codex-win32-x64",
+        _npm_root() / "node_modules" / "@openai" / "codex-win32-arm64",
+    ]
+    triples = ("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc")
+    for root in roots:
+        for triple in triples:
+            candidate = root / "vendor" / triple / "bin" / "codex.exe"
+            if candidate.exists():
+                return str(candidate)
+    return None
+
+
+def _find_node_js_codex() -> list[str] | None:
+    js = _npm_root() / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+    node = shutil.which("node")
+    if js.exists() and node:
+        return [node, str(js)]
+    return None
+
+
+def _without_console_wrapper(command: list[str]) -> list[str]:
+    if not command:
+        return command
+    first = command[0].lower()
+    if first.endswith((".cmd", ".bat", ".ps1")):
+        unwrapped = _find_native_codex()
+        if unwrapped:
+            return [unwrapped]
+        node_js = _find_node_js_codex()
+        if node_js:
+            return node_js
+    return command
 
 
 def _split_or_single(value: str) -> list[str]:
