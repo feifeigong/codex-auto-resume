@@ -25,6 +25,8 @@ class AppConfig:
     lookback_hours: float = 36
     poll_seconds: float = 30
     reset_buffer_seconds: float = 45
+    # 旧版把这个数当成一条对话的终身续跑次数，额度再回来也不会续。
+    # 现在只表示同一轮中断最多自动续几次；新的一轮 usage limit 会再续。
     max_auto_windows: int = 1
     ready_used_percent: float = 99.0
     recovery_drop_percent: float = 20.0

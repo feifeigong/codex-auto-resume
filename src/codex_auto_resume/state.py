@@ -17,6 +17,8 @@ class ThreadState:
     resets_at: int | None = None
     observed_at: float = 0.0
     resumes: int = 0
+    handled_mark: str = ""
+    failed_mark: str = ""
     phase: str = "idle"
     pid: int | None = None
     log_file: str | None = None

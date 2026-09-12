@@ -134,7 +134,7 @@ def cmd_status(cfg: AppConfig) -> int:
     for task in state.threads.values():
         print(
             f"  - {task.thread_id}  enabled={task.enabled}  status={task.status}  "
-            f"resumes={task.resumes}/{cfg.max_auto_windows}"
+            f"resumes={task.resumes}"
         )
     return 0
 

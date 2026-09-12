@@ -103,16 +103,13 @@ def tick(
                 task.status = "needs-review"
                 task.last_error = "上次续跑提交未确认完成，已停止自动重试，避免重复执行"
                 continue
-            if task.resumes >= cfg.max_auto_windows:
-                task.status = "resume-cap-reached"
-                continue
             match = next((item for item in waiting if item.thread_id == thread_id), None)
             if match is None:
                 continue
-            if task.phase == "failed" and task.mark == match.mark:
+            if task.phase == "failed" and task.failed_mark == match.mark:
                 task.status = "resume-failed"
                 continue
-            if task.mark == match.mark and task.resumes:
+            if task.handled_mark == match.mark:
                 task.status = "already-handled"
                 continue
             if not recovered:
@@ -262,10 +259,13 @@ def _resume_one(
         task.phase = "sent"
         task.status = "resumed"
         task.resumes += 1
+        task.handled_mark = task.mark
+        task.failed_mark = ""
         task.log_file = str(log_file)
         task.last_error = mode
     except Exception as exc:
         task.phase = "failed"
         task.status = "resume-failed"
+        task.failed_mark = task.mark
         task.last_error = str(exc)
         task.log_file = str(log_file)

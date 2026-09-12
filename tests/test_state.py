@@ -12,11 +12,21 @@ class StateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             state = load_state(root)
-            upsert_thread(state, "abc", phase="submitting", status="resuming", resumes=0)
+            upsert_thread(
+                state,
+                "abc",
+                phase="submitting",
+                status="resuming",
+                resumes=0,
+                handled_mark="mark-1",
+                failed_mark="",
+            )
             save_state(root, state)
             again = load_state(root)
             self.assertEqual(again.threads["abc"].phase, "submitting")
             self.assertEqual(again.threads["abc"].status, "resuming")
+            self.assertEqual(again.threads["abc"].handled_mark, "mark-1")
+            self.assertEqual(again.threads["abc"].failed_mark, "")
 
 
 if __name__ == "__main__":

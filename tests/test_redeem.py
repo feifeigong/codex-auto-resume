@@ -11,7 +11,8 @@ from codex_auto_resume.config import AppConfig, DEFAULT_PROMPT, LEGACY_PROMPT, l
 from codex_auto_resume.daemon import LiveQuota, tick
 from codex_auto_resume.quota import parse_quota_payload, should_redeem_weekly_reset
 from codex_auto_resume.redeem import try_redeem_weekly_reset
-from codex_auto_resume.state import AppState
+from codex_auto_resume.sessions import WaitingSession
+from codex_auto_resume.state import AppState, upsert_thread
 try:
     from fakes import FakeQuotaClient
 except ImportError:  # pragma: no cover
@@ -340,6 +341,120 @@ class SimulatedDaemonTests(unittest.TestCase):
         after, note = live.try_redeem(snap, AppState(), 1)
         self.assertEqual(note, "")
         self.assertIs(after, snap)
+
+
+def _waiting(mark: str) -> WaitingSession:
+    return WaitingSession(
+        thread_id=THREAD,
+        cwd="C:/tmp",
+        path=Path("dummy.jsonl"),
+        mark=mark,
+        resets_at=9_999_999_999,
+        observed_at=1.0,
+        snapshot=None,
+        reason="usage-limit",
+    )
+
+
+class ResumeCapTests(unittest.TestCase):
+    @patch("codex_auto_resume.daemon.process_running", return_value=False)
+    @patch("codex_auto_resume.daemon.scan_waiting_sessions")
+    def test_same_mark_is_not_resumed_twice(self, scan, _running) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cfg = _cfg(root)
+            client = FakeQuotaClient(primary_used=0, weekly_used=17)
+            reader = FakeLiveQuota(cfg, client)
+            scan.return_value = [_waiting("mark-1")]
+            with patch("codex_auto_resume.daemon.spawn_resume", return_value=(100, "queue")) as spawn:
+                state = tick(cfg, quota_reader=reader)
+            spawn.assert_called_once()
+            self.assertEqual(state.threads[THREAD].handled_mark, "mark-1")
+            self.assertEqual(state.threads[THREAD].resumes, 1)
+
+            with patch("codex_auto_resume.daemon.spawn_resume") as spawn2:
+                state = tick(cfg, state=state, quota_reader=reader)
+            spawn2.assert_not_called()
+            self.assertEqual(state.threads[THREAD].status, "already-handled")
+            self.assertEqual(state.threads[THREAD].resumes, 1)
+
+    @patch("codex_auto_resume.daemon.process_running", return_value=False)
+    @patch("codex_auto_resume.daemon.scan_waiting_sessions")
+    def test_new_mark_resumes_again_after_quota_returns(self, scan, _running) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cfg = _cfg(root, max_auto_windows=1)
+            client = FakeQuotaClient(primary_used=0, weekly_used=17)
+            reader = FakeLiveQuota(cfg, client)
+            scan.return_value = [_waiting("mark-1")]
+            with patch("codex_auto_resume.daemon.spawn_resume", return_value=(100, "queue")):
+                state = tick(cfg, quota_reader=reader)
+            self.assertEqual(state.threads[THREAD].resumes, 1)
+
+            scan.return_value = [_waiting("mark-2")]
+            with patch("codex_auto_resume.daemon.spawn_resume", return_value=(101, "queue")) as spawn:
+                state = tick(cfg, state=state, quota_reader=reader)
+            spawn.assert_called_once()
+            self.assertEqual(state.threads[THREAD].handled_mark, "mark-2")
+            self.assertEqual(state.threads[THREAD].resumes, 2)
+            self.assertEqual(state.threads[THREAD].status, "resumed")
+
+    @patch("codex_auto_resume.daemon.process_running", return_value=False)
+    @patch("codex_auto_resume.daemon.scan_waiting_sessions")
+    def test_old_lifetime_cap_state_still_resumes_new_window(self, scan, _running) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cfg = _cfg(root, max_auto_windows=1)
+            state = AppState()
+            upsert_thread(
+                state,
+                THREAD,
+                enabled=True,
+                status="resume-cap-reached",
+                mark="mark-2",
+                resumes=1,
+                phase="sent",
+                handled_mark="",
+            )
+            scan.return_value = [_waiting("mark-2")]
+            client = FakeQuotaClient(primary_used=0, weekly_used=17)
+            with patch("codex_auto_resume.daemon.spawn_resume", return_value=(102, "queue")) as spawn:
+                state = tick(cfg, state=state, quota_reader=FakeLiveQuota(cfg, client))
+            spawn.assert_called_once()
+            self.assertEqual(state.threads[THREAD].status, "resumed")
+            self.assertEqual(state.threads[THREAD].handled_mark, "mark-2")
+            self.assertEqual(state.threads[THREAD].resumes, 2)
+
+    @patch("codex_auto_resume.daemon.process_running", return_value=False)
+    @patch("codex_auto_resume.daemon.scan_waiting_sessions")
+    def test_failed_mark_does_not_block_later_window(self, scan, _running) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cfg = _cfg(root)
+            state = AppState()
+            upsert_thread(
+                state,
+                THREAD,
+                enabled=True,
+                status="resume-failed",
+                mark="mark-1",
+                failed_mark="mark-1",
+                phase="failed",
+                resumes=0,
+            )
+            scan.return_value = [_waiting("mark-1")]
+            client = FakeQuotaClient(primary_used=0, weekly_used=17)
+            with patch("codex_auto_resume.daemon.spawn_resume") as spawn:
+                state = tick(cfg, state=state, quota_reader=FakeLiveQuota(cfg, client))
+            spawn.assert_not_called()
+            self.assertEqual(state.threads[THREAD].status, "resume-failed")
+
+            scan.return_value = [_waiting("mark-2")]
+            with patch("codex_auto_resume.daemon.spawn_resume", return_value=(103, "queue")) as spawn:
+                state = tick(cfg, state=state, quota_reader=FakeLiveQuota(cfg, client))
+            spawn.assert_called_once()
+            self.assertEqual(state.threads[THREAD].status, "resumed")
+            self.assertEqual(state.threads[THREAD].handled_mark, "mark-2")
 
 
 if __name__ == "__main__":
