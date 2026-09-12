@@ -9,7 +9,8 @@ from .config import AppConfig
 from .paths import resolve_codex_command, sessions_dir
 from .quota import QuotaSnapshot, hint_reset_at, parse_quota_payload, quota_recovered
 from .redeem import try_redeem_weekly_reset
-from .resume import process_running, spawn_resume
+from .procutil import claim_watch_pid, process_running, release_watch_pid
+from .resume import spawn_resume
 from .sessions import WaitingSession, latest_quota_from_rollouts, scan_waiting_sessions
 from .state import AppState, load_state, save_state, upsert_thread
 
@@ -131,6 +132,9 @@ def tick(
 def watch_forever(cfg: AppConfig) -> None:
     state_dir = cfg.resolved_state_dir()
     state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = state_dir / "watch.pid"
+    if not claim_watch_pid(lock_path):
+        raise RuntimeError("已经有一个 watch 在运行，不要同时开两个")
     reader = LiveQuota(cfg)
     try:
         while True:
@@ -150,6 +154,7 @@ def watch_forever(cfg: AppConfig) -> None:
             time.sleep(delay)
     finally:
         reader.close()
+        release_watch_pid(lock_path)
 
 
 class LiveQuota:

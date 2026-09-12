@@ -4,6 +4,7 @@ import ctypes
 import os
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 
@@ -27,6 +28,31 @@ def hidden_popen(args: list[str], **kwargs: Any) -> subprocess.Popen:
     merged = hidden_kwargs()
     merged.update(kwargs)
     return subprocess.Popen(args, **merged)
+
+
+def claim_watch_pid(path: Path) -> bool:
+    if path.exists():
+        try:
+            old = int(path.read_text(encoding="utf-8").strip().split()[0])
+        except (OSError, ValueError):
+            old = 0
+        if process_running(old) and old != os.getpid():
+            return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    return True
+
+
+def release_watch_pid(path: Path) -> None:
+    try:
+        current = int(path.read_text(encoding="utf-8").strip().split()[0])
+    except (OSError, ValueError):
+        return
+    if current == os.getpid():
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def process_running(pid: int | None) -> bool:

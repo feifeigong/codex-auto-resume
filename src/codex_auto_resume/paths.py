@@ -71,6 +71,8 @@ def _npm_root() -> Path:
 
 
 def _find_native_codex() -> str | None:
+    if sys.platform != "win32":
+        return None
     roots = [
         _npm_root() / "node_modules" / "@openai" / "codex",
         _npm_root() / "node_modules" / "@openai" / "codex-win32-x64",

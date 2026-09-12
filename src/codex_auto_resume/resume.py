@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 
 from .paths import resolve_codex_command
-from .procutil import hidden_popen, process_running
+from .procutil import hidden_popen
 
 BUSY_HINTS = (
     "already owns",
@@ -13,6 +14,7 @@ BUSY_HINTS = (
     "cannot resume",
     "thread is loaded",
     "held open",
+    "active writer",
     "-32600",
 )
 
@@ -42,6 +44,7 @@ def spawn_resume(
     handle = log_file.open("a", encoding="utf-8", errors="replace")
     handle.write(f"$ {' '.join(args)}\n")
     handle.flush()
+    output_from = log_file.stat().st_size
     proc = hidden_popen(
         args,
         cwd=cwd if cwd and Path(cwd).exists() else None,
@@ -49,14 +52,15 @@ def spawn_resume(
         stderr=subprocess.STDOUT,
         env=env,
     )
-    if prefer_queue_if_busy:
-        try:
-            code = proc.wait(timeout=8)
-        except subprocess.TimeoutExpired:
-            return proc.pid, "exec-resume"
-        output = log_file.read_text(encoding="utf-8", errors="replace")[-2000:].lower()
-        if code != 0 and any(hint in output for hint in BUSY_HINTS):
-            handle.write("\n# exec resume failed, fallback to queue\n")
+    if not prefer_queue_if_busy:
+        return proc.pid, "exec-resume"
+
+    deadline = time.time() + 8
+    while True:
+        output = _log_since(log_file, output_from)
+        if _looks_busy(output):
+            _stop(proc)
+            handle.write("\n# exec resume busy, fallback to queue\n")
             handle.flush()
             return _spawn_queue(
                 command=command,
@@ -67,10 +71,17 @@ def spawn_resume(
                 env=env,
                 extra_args=extra_args,
             ), "queue"
-        if code != 0:
-            raise RuntimeError(f"codex exec resume 失败，exit={code}，详见 {log_file}")
-        return proc.pid, "exec-resume-finished"
-    return proc.pid, "exec-resume"
+        code = proc.poll()
+        if code is not None:
+            if code != 0:
+                raise RuntimeError(f"codex exec resume 失败，exit={code}，详见 {log_file}")
+            return proc.pid, "exec-resume-finished"
+        if time.time() >= deadline:
+            if "error:" in output:
+                _stop(proc)
+                raise RuntimeError(f"codex exec resume 超时且已报错，详见 {log_file}")
+            return proc.pid, "exec-resume"
+        time.sleep(0.2)
 
 
 def _spawn_queue(
@@ -94,3 +105,30 @@ def _spawn_queue(
         env=env,
     )
     return proc.pid
+
+
+def _looks_busy(output: str) -> bool:
+    return any(hint in output for hint in BUSY_HINTS)
+
+
+def _log_since(log_file: Path, start: int) -> str:
+    try:
+        data = log_file.read_bytes()
+    except OSError:
+        return ""
+    if start < 0 or start > len(data):
+        start = 0
+    return data[start:].decode("utf-8", errors="replace").lower()
+
+
+def _stop(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=2)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass

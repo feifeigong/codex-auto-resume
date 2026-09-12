@@ -54,6 +54,9 @@ def main(argv: list[str] | None = None) -> int:
             watch_forever(cfg)
         except KeyboardInterrupt:
             return 0
+        except RuntimeError as exc:
+            print(exc, file=sys.stderr)
+            return 1
         return 0
     if args.cmd == "enable":
         return cmd_enable(cfg, args.thread_id, True)
