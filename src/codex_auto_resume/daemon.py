@@ -102,7 +102,7 @@ def tick(
         for thread_id, task in list(state.threads.items()):
             if not task.enabled:
                 continue
-            if process_running(task.pid):
+            if process_running(task.pid, started_at=task.last_resume_at or None):
                 task.status = "running"
                 continue
             if task.phase == "submitting":
