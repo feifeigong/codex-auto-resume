@@ -145,7 +145,12 @@ def watch_forever(cfg: AppConfig) -> None:
     reader = LiveQuota(cfg)
     try:
         while True:
-            state = tick(cfg, quota_reader=reader)
+            try:
+                state = tick(cfg, quota_reader=reader)
+            except Exception as exc:
+                _log(cfg, f"tick failed: {exc}")
+                time.sleep(max(5.0, float(cfg.poll_seconds)))
+                continue
             delay = max(5.0, float(cfg.poll_seconds))
             resets = [
                 task.resets_at

@@ -28,6 +28,18 @@ class StateTests(unittest.TestCase):
             self.assertEqual(again.threads["abc"].handled_mark, "mark-1")
             self.assertEqual(again.threads["abc"].failed_mark, "")
 
+    def test_all_zero_state_is_quarantined(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            broken = root / "state.json"
+            broken.write_bytes(b"\x00" * 32)
+            state = load_state(root)
+            self.assertEqual(state.threads, {})
+            self.assertFalse(broken.exists())
+            quarantined = list(root.glob("state.json.broken-*"))
+            self.assertEqual(len(quarantined), 1)
+            self.assertIn("已损坏", (root / "daemon.log").read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

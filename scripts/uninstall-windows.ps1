@@ -13,8 +13,8 @@ if (Test-Path $StartupScript) {
   Write-Host "Removed startup script: $StartupScript"
 }
 
-Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" |
-  Where-Object { $_.CommandLine -and $_.CommandLine -like "*codex-auto-resume*run.py*watch*" } |
+Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe' OR Name = 'wscript.exe'" |
+  Where-Object { $_.CommandLine -and ($_.CommandLine -like "*codex-auto-resume*run.py*watch*" -or $_.CommandLine -like "*codex-auto-resume.vbs*") } |
   ForEach-Object {
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
     Write-Host "Stopped process: $($_.ProcessId)"

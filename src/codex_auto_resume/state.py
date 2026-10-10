@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -44,11 +45,42 @@ def state_path(state_dir: Path) -> Path:
     return state_dir / "state.json"
 
 
+def _quarantine_state(path: Path) -> None:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = path.with_name(f"state.json.broken-{stamp}")
+    try:
+        path.replace(dest)
+    except OSError:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _note(state_dir: Path, message: str) -> None:
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        path = state_dir / "daemon.log"
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{stamp} {message}\n")
+    except OSError:
+        pass
+
+
 def load_state(state_dir: Path) -> AppState:
     path = state_path(state_dir)
     if not path.exists():
         return AppState()
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        text = path.read_text(encoding="utf-8").strip("\x00").strip()
+        raw = json.loads(text) if text else None
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raw = None
+    if not isinstance(raw, dict):
+        _quarantine_state(path)
+        _note(state_dir, "state.json 已损坏，已挪走并从头记录。之前跟踪过的对话会按最近会话重新发现")
+        return AppState()
     threads = {}
     for key, value in (raw.get("threads") or {}).items():
         if not isinstance(value, dict):
